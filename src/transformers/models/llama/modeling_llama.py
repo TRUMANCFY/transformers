@@ -51,6 +51,7 @@ from ...utils import (
 )
 from .configuration_llama import LlamaConfig
 
+logging.set_verbosity_info()
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
@@ -375,7 +376,7 @@ class LlamaAttention(nn.Module):
             rank = torch.distributed.get_rank()
         else:
             rank = 'N/A'
-        logger.info(f"Rank {rank} - inbatch_attn shape: {hidden_states.shape}")
+        # logger.info(f"Rank {rank} - inbatch_attn shape: {hidden_states.shape}")
         
         bsz, q_len, _ = hidden_states.size()
 
@@ -435,23 +436,31 @@ class LlamaAttention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)        
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         # shape: (B, n_heads, L, head_dim)
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = torch.matmul(attn_weights, value_states)        
 
+        if inbatch_attn is not None:
+            assert cached_key_value is not None
+            # logger.info(f"Rank {rank} - inbatch_attn shape: {inbatch_attn.shape}")
+        
+        # if cached_key_value is not None:
+            # logger.info(f"Rank {rank} - cached_key_value shape: {cached_key_value[0].shape}, {cached_key_value[1].shape}")
+        
         if inbatch_attn is not None and cached_key_value is not None:
         # Debugging: Log shapes to diagnose rank disagreement
-            if self.layer_idx == 0:
-                if torch.distributed.is_initialized():
-                    rank = torch.distributed.get_rank()
-                else:
-                    rank = 'N/A'
-                logger.info(f"Rank {rank} - inbatch_attn shape: {inbatch_attn.shape}")
-                if isinstance(cached_key_value, (list, tuple)) and len(cached_key_value) >= 2:
-                    logger.info(
-                        f"Rank {rank} - cached_key_value[0] shape: {cached_key_value[0].shape}, "
-                        f"cached_key_value[1] shape: {cached_key_value[1].shape}"
-                    )
-                else:
-                    logger.warning(f"Rank {rank} - cached_key_value is not a list/tuple with at least two elements.")
+            # if self.layer_idx == 0:
+            #     if torch.distributed.is_initialized():
+            #         rank = torch.distributed.get_rank()
+            #     else:
+            #         rank = 'N/A'
+            #     logger.info(f"Rank {rank} - inbatch_attn shape: {inbatch_attn.shape}")
+                
+            #     if isinstance(cached_key_value, (list, tuple)) and len(cached_key_value) >= 2:
+            #         logger.info(
+            #             f"Rank {rank} - cached_key_value[0] shape: {cached_key_value[0].shape}, "
+            #             f"cached_key_value[1] shape: {cached_key_value[1].shape}"
+            #         )
+                # else:
+                    # logger.warning(f"Rank {rank} - cached_key_value is not a list/tuple with at least two elements.")
             
             cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
@@ -469,18 +478,16 @@ class LlamaAttention(nn.Module):
             if original_attention_mask is not None:
                 # origianl_attention_mask is for key, instead of query
                 # as for query, it is already covered by the causal mask
-                if original_attention_mask.dim == 2:
-                    min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
-                    original_attention_mask = original_attention_mask[None, :, None, None, :]
-                    padding_mask = original_attention_mask == 0
-                    original_attention_mask = original_attention_mask.masked_fill(
-                        padding_mask, min_dtype
-                    )
+                min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
+                # original_attention_mask = original_attention_mask[None, :, None, None, :]
+                padding_mask = original_attention_mask == 0
+                original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                    padding_mask, min_dtype
+                )
                 
-                assert original_attention_mask.dim == 5
+                # assert original_attention_mask.dim == 5
                 # add original casual mask
-                inbatch_causal_mask = original_attention_mask[:, :, :, :, : cached_keys.shape[-2]]
-                inbatch_attn_weights = inbatch_attn_weights + inbatch_causal_mask
+                inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
 
             inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
@@ -490,11 +497,9 @@ class LlamaAttention(nn.Module):
             # B x B x num_heads x seq_len x head_dim
             inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
 
-            # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim
-            inbatch_attn = inbatch_attn[:, :, None, None, None]
-           
+            # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
             # inbatch_attn_output : B x B x num_heads x seq_len x head_dim
-            inbatch_attn_output = inbatch_attn_output * inbatch_attn
+            inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
             inbatch_attn_output = inbatch_attn_output.sum(dim=1)
             
             # TODO: currently just add - we need to think more about other combinations
@@ -754,8 +759,9 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
-        self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+        # logger.info(f"config._attn_implementation: {config._attn_implementation}")
+        # self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
+        self.self_attn = LLAMA_ATTENTION_CLASSES["eager"](config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1088,7 +1094,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     position_ids=position_ids,
                     past_key_value=past_key_values,
                     inbatch_attn=inbatch_attn,
-                    cached_key_values=cached_key_values[layer_idx] if cached_key_values is not None else None,
+                    cached_key_value=cached_key_values[layer_idx] if cached_key_values is not None else None,
                     original_attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
