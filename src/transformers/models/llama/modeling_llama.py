@@ -51,7 +51,6 @@ from ...utils import (
 )
 from .configuration_llama import LlamaConfig
 
-
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LlamaConfig"
@@ -364,11 +363,20 @@ class LlamaAttention(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
+        inbatch_attn: Optional[torch.Tensor] = None,
+        cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        original_attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = 'N/A'
+        logger.info(f"Rank {rank} - inbatch_attn shape: {hidden_states.shape}")
+        
         bsz, q_len, _ = hidden_states.size()
 
         if self.config.pretraining_tp > 1:
@@ -423,9 +431,75 @@ class LlamaAttention(nn.Module):
             attn_weights = attn_weights + causal_mask
 
         # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        # attn_weights: (B, n_heads, seq_len, seq_len)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)        
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+        # shape: (B, n_heads, L, head_dim)
         attn_output = torch.matmul(attn_weights, value_states)
+
+        if inbatch_attn is not None and cached_key_value is not None:
+        # Debugging: Log shapes to diagnose rank disagreement
+            if self.layer_idx == 0:
+                if torch.distributed.is_initialized():
+                    rank = torch.distributed.get_rank()
+                else:
+                    rank = 'N/A'
+                logger.info(f"Rank {rank} - inbatch_attn shape: {inbatch_attn.shape}")
+                if isinstance(cached_key_value, (list, tuple)) and len(cached_key_value) >= 2:
+                    logger.info(
+                        f"Rank {rank} - cached_key_value[0] shape: {cached_key_value[0].shape}, "
+                        f"cached_key_value[1] shape: {cached_key_value[1].shape}"
+                    )
+                else:
+                    logger.warning(f"Rank {rank} - cached_key_value is not a list/tuple with at least two elements.")
+            
+            cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
+            cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
+            cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
+            cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+
+            # 1 x B x num_heads x seq_len x head_dim
+            cached_key_expanded = cached_keys.unsqueeze(0)
+            # B x 1 x num_heads x seq_len x head_dim
+            query_states_expanded = query_states.unsqueeze(1)
+            ## TODO: may need to check whether we need to repeat_kv - for llama, normally self.num_heads == self.num_key_value_heads -> no need to repeat_kv
+            # B (query) x B (key) x num_heads x seq_len x head_dim
+            inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            if original_attention_mask is not None:
+                # origianl_attention_mask is for key, instead of query
+                # as for query, it is already covered by the causal mask
+                if original_attention_mask.dim == 2:
+                    min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
+                    original_attention_mask = original_attention_mask[None, :, None, None, :]
+                    padding_mask = original_attention_mask == 0
+                    original_attention_mask = original_attention_mask.masked_fill(
+                        padding_mask, min_dtype
+                    )
+                
+                assert original_attention_mask.dim == 5
+                # add original casual mask
+                inbatch_causal_mask = original_attention_mask[:, :, :, :, : cached_keys.shape[-2]]
+                inbatch_attn_weights = inbatch_attn_weights + inbatch_causal_mask
+
+            inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
+            
+            # 1 x B x num_heads x seq_len x head_dim
+            catched_value_expanded = cached_values.unsqueeze(0)
+            # B x B x num_heads x seq_len x head_dim
+            inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
+
+            # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim
+            inbatch_attn = inbatch_attn[:, :, None, None, None]
+           
+            # inbatch_attn_output : B x B x num_heads x seq_len x head_dim
+            inbatch_attn_output = inbatch_attn_output * inbatch_attn
+            inbatch_attn_output = inbatch_attn_output.sum(dim=1)
+            
+            # TODO: currently just add - we need to think more about other combinations
+            attn_output = attn_output + inbatch_attn_output
+
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -693,6 +767,9 @@ class LlamaDecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
+        inbatch_attn: Optional[torch.Tensor] = None,
+        cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        original_attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -731,6 +808,9 @@ class LlamaDecoderLayer(nn.Module):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
+            inbatch_attn=inbatch_attn,
+            cached_key_value=cached_key_value,
+            original_attention_mask=original_attention_mask,
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
@@ -917,6 +997,8 @@ class LlamaModel(LlamaPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        inbatch_attn: Optional[torch.Tensor] = None,
+        cached_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -980,7 +1062,7 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -991,6 +1073,9 @@ class LlamaModel(LlamaPreTrainedModel):
                     causal_mask,
                     position_ids,
                     past_key_values,
+                    inbatch_attn,
+                    cached_key_values[layer_idx] if cached_key_values is not None else None,
+                    attention_mask,
                     output_attentions,
                     use_cache,
                     cache_position,
@@ -1002,6 +1087,9 @@ class LlamaModel(LlamaPreTrainedModel):
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
+                    inbatch_attn=inbatch_attn,
+                    cached_key_values=cached_key_values[layer_idx] if cached_key_values is not None else None,
+                    original_attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
@@ -1139,6 +1227,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        inbatch_attn: Optional[torch.Tensor] = None,
+        cached_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -1191,6 +1281,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            inbatch_attn=inbatch_attn,
+            cached_key_values=cached_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
@@ -1238,6 +1330,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
+            labels=labels,
         )
 
     def prepare_inputs_for_generation(
