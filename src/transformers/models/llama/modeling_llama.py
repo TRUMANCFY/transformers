@@ -364,9 +364,9 @@ class LlamaAttention(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
-        inbatch_attn: Optional[torch.Tensor] = None,
+        inbatch_attn: Optional[torch.Tensor] = None, # B x B
         cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        original_attention_mask: Optional[torch.Tensor] = None,
+        original_attention_mask: Optional[torch.Tensor] = None, # B x L
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
@@ -437,16 +437,9 @@ class LlamaAttention(nn.Module):
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         # shape: (B, n_heads, L, head_dim)
         attn_output = torch.matmul(attn_weights, value_states)        
-
-        if inbatch_attn is not None:
-            assert cached_key_value is not None
-            # logger.info(f"Rank {rank} - inbatch_attn shape: {inbatch_attn.shape}")
-        
-        # if cached_key_value is not None:
-            # logger.info(f"Rank {rank} - cached_key_value shape: {cached_key_value[0].shape}, {cached_key_value[1].shape}")
         
         if inbatch_attn is not None and cached_key_value is not None:
-        # Debugging: Log shapes to diagnose rank disagreement
+            # Debugging: Log shapes to diagnose rank disagreement
             # if self.layer_idx == 0:
             #     if torch.distributed.is_initialized():
             #         rank = torch.distributed.get_rank()
@@ -469,9 +462,8 @@ class LlamaAttention(nn.Module):
 
             # 1 x B x num_heads x seq_len x head_dim
             cached_key_expanded = cached_keys.unsqueeze(0)
-            # B x 1 x num_heads x seq_len x head_dim
+            # B x 1 x num_heads x seq_len x head_dim - Solved: may need to check whether we need to repeat_kv - for llama, normally self.num_heads == self.num_key_value_heads -> no need to repeat_kv
             query_states_expanded = query_states.unsqueeze(1)
-            ## TODO: may need to check whether we need to repeat_kv - for llama, normally self.num_heads == self.num_key_value_heads -> no need to repeat_kv
             # B (query) x B (key) x num_heads x seq_len x head_dim
             inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
@@ -483,17 +475,16 @@ class LlamaAttention(nn.Module):
                 padding_mask = original_attention_mask == 0
                 original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
                     padding_mask, min_dtype
-                )
-                
-                # assert original_attention_mask.dim == 5
+                )                
                 # add original casual mask
                 inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
 
+            # B (query) x B (key) x num_heads x seq_len x head_dim
             inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
             
             # 1 x B x num_heads x seq_len x head_dim
-            catched_value_expanded = cached_values.unsqueeze(0)
+            catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
             # B x B x num_heads x seq_len x head_dim
             inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
 
@@ -502,7 +493,7 @@ class LlamaAttention(nn.Module):
             inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
             inbatch_attn_output = inbatch_attn_output.sum(dim=1)
             
-            # TODO: currently just add - we need to think more about other combinations
+            # TODO: currently just add - we need to think more about other combinations - learnable parameter
             attn_output = attn_output + inbatch_attn_output
 
 
@@ -664,6 +655,9 @@ class LlamaSdpaAttention(LlamaAttention):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
+        inbatch_attn: Optional[torch.Tensor] = None, # B x B
+        cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        original_attention_mask: Optional[torch.Tensor] = None, # B x L
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
@@ -740,6 +734,64 @@ class LlamaSdpaAttention(LlamaAttention):
             is_causal=is_causal,
         )
 
+        if inbatch_attn is not None and cached_key_value is not None:
+            # Debugging: Log shapes to diagnose rank disagreement
+            # if self.layer_idx == 0:
+            #     if torch.distributed.is_initialized():
+            #         rank = torch.distributed.get_rank()
+            #     else:
+            #         rank = 'N/A'
+            #     logger.info(f"Rank {rank} - inbatch_attn shape: {inbatch_attn.shape}")
+                
+            #     if isinstance(cached_key_value, (list, tuple)) and len(cached_key_value) >= 2:
+            #         logger.info(
+            #             f"Rank {rank} - cached_key_value[0] shape: {cached_key_value[0].shape}, "
+            #             f"cached_key_value[1] shape: {cached_key_value[1].shape}"
+            #         )
+                # else:
+                    # logger.warning(f"Rank {rank} - cached_key_value is not a list/tuple with at least two elements.")
+            
+            cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
+            cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
+            cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
+            cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+
+            # 1 x B x num_heads x seq_len x head_dim
+            cached_key_expanded = cached_keys.unsqueeze(0)
+            # B x 1 x num_heads x seq_len x head_dim - Solved: may need to check whether we need to repeat_kv - for llama, normally self.num_heads == self.num_key_value_heads -> no need to repeat_kv
+            query_states_expanded = query_states.unsqueeze(1)
+            # B (query) x B (key) x num_heads x seq_len x head_dim
+            inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            if original_attention_mask is not None:
+                # origianl_attention_mask is for key, instead of query
+                # as for query, it is already covered by the causal mask
+                min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
+                # original_attention_mask = original_attention_mask[None, :, None, None, :]
+                padding_mask = original_attention_mask == 0
+                original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                    padding_mask, min_dtype
+                )                
+                # add original casual mask
+                inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+
+            # B (query) x B (key) x num_heads x seq_len x head_dim
+            inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
+            
+            # 1 x B x num_heads x seq_len x head_dim
+            catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
+            # B x B x num_heads x seq_len x head_dim
+            inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
+
+            # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
+            # inbatch_attn_output : B x B x num_heads x seq_len x head_dim
+            inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
+            inbatch_attn_output = inbatch_attn_output.sum(dim=1)
+            
+            # TODO: currently just add - we need to think more about other combinations - learnable parameter
+            attn_output = attn_output + inbatch_attn_output
+
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, -1)
 
@@ -759,9 +811,7 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        # logger.info(f"config._attn_implementation: {config._attn_implementation}")
-        # self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
-        self.self_attn = LLAMA_ATTENTION_CLASSES["eager"](config=config, layer_idx=layer_idx)
+        self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
