@@ -760,7 +760,7 @@ class LlamaSdpaAttention(LlamaAttention):
             cached_key_expanded = cached_keys.unsqueeze(0)
             # B x 1 x num_heads x seq_len x head_dim - Solved: may need to check whether we need to repeat_kv - for llama, normally self.num_heads == self.num_key_value_heads -> no need to repeat_kv
             query_states_expanded = query_states.unsqueeze(1)
-            # B (query) x B (key) x num_heads x seq_len x head_dim
+            # B (query) x B (key) x num_heads x seq_len x seq_len
             inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
             if original_attention_mask is not None:
@@ -775,7 +775,7 @@ class LlamaSdpaAttention(LlamaAttention):
                 # add original casual mask
                 inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
 
-            # B (query) x B (key) x num_heads x seq_len x head_dim
+            # B (query) x B (key) x num_heads x seq_len x seq_len
             inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
             
