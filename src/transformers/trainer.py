@@ -274,6 +274,11 @@ if TYPE_CHECKING:
     if is_datasets_available():
         import datasets
 
+try:
+    import wandb
+except:
+    print("wandb is not installed, please install it if you want to log to wandb")
+
 logger = logging.get_logger(__name__)
 
 
@@ -2907,7 +2912,10 @@ class Trainer:
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
-
+            try:
+                wandb.log({'wandb_' + k: v for k, v in logs.items()})
+            except:
+                pass
             self.log(logs)
 
         metrics = None
