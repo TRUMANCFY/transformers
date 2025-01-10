@@ -783,6 +783,12 @@ class LlamaSdpaAttention(LlamaAttention):
             catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
             # B x B x num_heads x seq_len x head_dim
             inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
+            
+            value_norm = torch.norm(cached_values, p=2, dim=-1, keepdim=True)  # (..., seq_len, 1)
+            weighted_value_norm = torch.matmul(inbatch_attn_weights, value_norm)
+            epsilon = 1e-6  # Small constant for numerical stability
+            inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
+
 
             # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
             # inbatch_attn_output : B x B x num_heads x seq_len x head_dim
