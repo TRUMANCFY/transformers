@@ -2237,6 +2237,8 @@ class Trainer:
                 self._load_from_checkpoint(resume_from_checkpoint, self.model_wrapped)
 
         # Check if saved optimizer or scheduler states exist
+        print('++++++++++++++++++++++++++++++++')
+        print('self.lr_scheduler', self.lr_scheduler)
         self._load_optimizer_and_scheduler(resume_from_checkpoint)
 
         # important: at this point:
