@@ -785,10 +785,14 @@ class LlamaSdpaAttention(LlamaAttention):
             inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
             
             value_norm = torch.norm(cached_values, p=2, dim=-1, keepdim=True)  # (..., seq_len, 1)
+            # weighted_value_norm: B x B x (num_head) x seq_len x 1
             weighted_value_norm = torch.matmul(inbatch_attn_weights, value_norm)
+            
+            # if "head_normalization" in kwargs and kwargs["head_normalization"]:
+            #     weighted_value_norm = weighted_value_norm.sum(dim=2, keepdim=True)
+                        
             epsilon = 1e-6  # Small constant for numerical stability
             inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
-
 
             # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
             # inbatch_attn_output : B x B x num_heads x seq_len x head_dim
@@ -1067,6 +1071,7 @@ class LlamaModel(LlamaPreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1142,6 +1147,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    **kwargs,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1156,6 +1162,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    **kwargs,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1300,6 +1307,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         num_logits_to_keep: int = 0,
+        **kwargs,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         r"""
         Args:
@@ -1351,6 +1359,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            **kwargs,
         )
 
         hidden_states = outputs[0]
