@@ -2912,10 +2912,11 @@ class Trainer:
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
-            try:
-                wandb.log({'wandb_' + k: v for k, v in logs.items()})
-            except:
-                pass
+            if dist.get_rank() == 0:
+                try:
+                    wandb.log({'wandb_' + k: v for k, v in logs.items()})
+                except:
+                    pass
             self.log(logs)
 
         metrics = None
