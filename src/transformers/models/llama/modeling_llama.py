@@ -1383,6 +1383,32 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+
+            if "loss_on_second_half" in kwargs and kwargs["loss_on_second_half"]:
+                # 3) Vectorized approach: keep *only* the last half of real (non -100) tokens
+                #    for each sequence, set everything else to -100 so it doesn't contribute to loss.
+
+                # 3a) Identify which positions are real (not -100).
+                real_mask = (shift_labels != -100).long()  # shape: (B, seq_len-1)
+
+                # 3b) Count how many real tokens each sequence has.
+                real_counts = real_mask.sum(dim=1)  # shape: (B,)
+
+                # 3c) We want only the *second half* of the real tokens.
+                #     We'll compute, for each position, how many real tokens lie to the *right*
+                #     using a reversed cumulative sum, then compare it to half_counts.
+                rev_real_mask = torch.flip(real_mask, dims=[1])         # flip along seq dimension
+                rev_cumsumed  = torch.cumsum(rev_real_mask, dim=1)      # cumsum from the right
+                cumsumed      = torch.flip(rev_cumsumed, dims=[1])      # flip back
+
+                half_counts = real_counts // 2                          # integer half
+
+                # 3d) A position is kept if it’s a real token AND among the last half.
+                keep_mask = (cumsumed <= half_counts.unsqueeze(1)) & (shift_labels != -100)
+
+                # 3e) Set everything else to -100 (ignored in the loss).
+                shift_labels[~keep_mask] = -100
+            
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
