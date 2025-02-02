@@ -1382,8 +1382,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             if "first_half_mask" in kwargs and kwargs["first_half_mask"] is not None:
                 first_half_mask = kwargs["first_half_mask"]
                 effective_mask = first_half_mask[..., 1:]
-                # ignore_index is set as ignore_index by default
-                shift_labels = shift_labels.masked_fill(effective_mask, ignore_index)
+                # ignore_index is set as -100 by default
+                shift_labels = shift_labels.masked_fill(effective_mask, -100)
             
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
