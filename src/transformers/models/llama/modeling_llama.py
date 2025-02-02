@@ -788,10 +788,11 @@ class LlamaSdpaAttention(LlamaAttention):
             inbatch_attn_output = inbatch_attn_output.sum(dim=1)
 
             if "first_half_mask" in kwargs and kwargs["first_half_mask"] is not None:
+                print('first_half_mask.shape', kwargs["first_half_mask"].shape)
                 # B x seq_len
                 first_half_mask = kwargs["first_half_mask"]
                 # remove the first half of the sequence
-                first_half_mask_expanded = first_half_mask.unsqueeze(1).unsqueeze(-1)
+                first_half_mask_expanded = first_half_mask.unsqueeze(1).unsqueeze(-1).bool()
                 inbatch_attn_output = inbatch_attn_output.masked_fill(first_half_mask_expanded, 0.0)                
             
             # TODO: currently just add - we need to think more about other combinations - learnable parameter
@@ -1381,7 +1382,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
             if "first_half_mask" in kwargs and kwargs["first_half_mask"] is not None:
                 first_half_mask = kwargs["first_half_mask"]
-                effective_mask = first_half_mask[..., 1:]
+                effective_mask = first_half_mask[..., 1:].bool()
                 # ignore_index is set as -100 by default
                 shift_labels = shift_labels.masked_fill(effective_mask, -100)
             
