@@ -738,23 +738,7 @@ class LlamaSdpaAttention(LlamaAttention):
             is_causal=is_causal,
         )
 
-        if inbatch_attn is not None and cached_key_value is not None:
-            # Debugging: Log shapes to diagnose rank disagreement
-            # if self.layer_idx == 0:
-            #     if torch.distributed.is_initialized():
-            #         rank = torch.distributed.get_rank()
-            #     else:
-            #         rank = 'N/A'
-            #     logger.info(f"Rank {rank} - inbatch_attn shape: {inbatch_attn.shape}")
-                
-            #     if isinstance(cached_key_value, (list, tuple)) and len(cached_key_value) >= 2:
-            #         logger.info(
-            #             f"Rank {rank} - cached_key_value[0] shape: {cached_key_value[0].shape}, "
-            #             f"cached_key_value[1] shape: {cached_key_value[1].shape}"
-            #         )
-                # else:
-                    # logger.warning(f"Rank {rank} - cached_key_value is not a list/tuple with at least two elements.")
-            
+        if inbatch_attn is not None and cached_key_value is not None:            
             cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
@@ -799,9 +783,16 @@ class LlamaSdpaAttention(LlamaAttention):
             inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
 
             # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
-            # inbatch_attn_output : B x B x num_heads x seq_len x head_dim
+            # inbatch_attn_output : B x num_heads x seq_len x head_dim
             inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
             inbatch_attn_output = inbatch_attn_output.sum(dim=1)
+
+            if "first_half_mask" in kwargs and kwargs["first_half_mask"] is not None:
+                # B x seq_len
+                first_half_mask = kwargs["first_half_mask"]
+                # remove the first half of the sequence
+                first_half_mask_expanded = first_half_mask.unsqueeze(1).unsqueeze(-1)
+                inbatch_attn_output = inbatch_attn_output.masked_fill(first_half_mask_expanded, 0.0)                
             
             # TODO: currently just add - we need to think more about other combinations - learnable parameter
             attn_output = attn_output + inbatch_attn_output
@@ -1388,30 +1379,10 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
 
-            if "loss_on_second_half" in kwargs and kwargs["loss_on_second_half"]:
-                # 3) Vectorized approach: keep *only* the last half of real (non -100) tokens
-                #    for each sequence, set everything else to -100 so it doesn't contribute to loss.
-
-                # 3a) Identify which positions are real (not -100).
-                real_mask = (shift_labels != -100).long()  # shape: (B, seq_len-1)
-
-                # 3b) Count how many real tokens each sequence has.
-                real_counts = real_mask.sum(dim=1)  # shape: (B,)
-
-                # 3c) We want only the *second half* of the real tokens.
-                #     We'll compute, for each position, how many real tokens lie to the *right*
-                #     using a reversed cumulative sum, then compare it to half_counts.
-                rev_real_mask = torch.flip(real_mask, dims=[1])         # flip along seq dimension
-                rev_cumsumed  = torch.cumsum(rev_real_mask, dim=1)      # cumsum from the right
-                cumsumed      = torch.flip(rev_cumsumed, dims=[1])      # flip back
-
-                half_counts = real_counts // 2                          # integer half
-
-                # 3d) A position is kept if it’s a real token AND among the last half.
-                keep_mask = (cumsumed <= half_counts.unsqueeze(1)) & (shift_labels != -100)
-
-                # 3e) Set everything else to -100 (ignored in the loss).
-                shift_labels[~keep_mask] = -100
+            if "first_half_mask" in kwargs and kwargs["first_half_mask"] is not None:
+                effective_mask = first_half_mask[..., 1:]
+                # ignore_index is set as ignore_index by default
+                shift_labels = shift_labels.masked_fill(effective_mask, ignore_index)
             
             # Flatten the tokens
             loss_fct = CrossEntropyLoss()
@@ -1433,6 +1404,31 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
             labels=labels,
         )
+
+            # if "loss_on_second_half" in kwargs and kwargs["loss_on_second_half"]:
+            #     # 3) Vectorized approach: keep *only* the last half of real (non -100) tokens
+            #     #    for each sequence, set everything else to -100 so it doesn't contribute to loss.
+
+            #     # 3a) Identify which positions are real (not -100).
+            #     real_mask = (shift_labels != -100).long()  # shape: (B, seq_len-1)
+
+            #     # 3b) Count how many real tokens each sequence has.
+            #     real_counts = real_mask.sum(dim=1)  # shape: (B,)
+
+            #     # 3c) We want only the *second half* of the real tokens.
+            #     #     We'll compute, for each position, how many real tokens lie to the *right*
+            #     #     using a reversed cumulative sum, then compare it to half_counts.
+            #     rev_real_mask = torch.flip(real_mask, dims=[1])         # flip along seq dimension
+            #     rev_cumsumed  = torch.cumsum(rev_real_mask, dim=1)      # cumsum from the right
+            #     cumsumed      = torch.flip(rev_cumsumed, dims=[1])      # flip back
+
+            #     half_counts = real_counts // 2                          # integer half
+
+            #     # 3d) A position is kept if it’s a real token AND among the last half.
+            #     keep_mask = (cumsumed <= half_counts.unsqueeze(1)) & (shift_labels != -100)
+
+            #     # 3e) Set everything else to -100 (ignored in the loss).
+            #     shift_labels[~keep_mask] = -100
 
     def prepare_inputs_for_generation(
         self,
