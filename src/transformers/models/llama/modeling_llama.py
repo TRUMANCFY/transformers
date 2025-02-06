@@ -787,12 +787,12 @@ class LlamaSdpaAttention(LlamaAttention):
             inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
             inbatch_attn_output = inbatch_attn_output.sum(dim=1)
 
-            # if "first_half_mask" in kwargs and kwargs["first_half_mask"] is not None:
-            #     # B x seq_len
-            #     first_half_mask = kwargs["first_half_mask"]
-            #     # remove the first half of the sequence
-            #     first_half_mask_expanded = first_half_mask.unsqueeze(1).unsqueeze(-1).bool()
-            #     inbatch_attn_output = inbatch_attn_output.masked_fill(first_half_mask_expanded, 0.0)                
+            if "first_half_mask" in kwargs and kwargs["first_half_mask"] is not None:
+                # B x seq_len
+                first_half_mask = kwargs["first_half_mask"]
+                # remove the first half of the sequence
+                first_half_mask_expanded = first_half_mask.unsqueeze(1).unsqueeze(-1).bool()
+                inbatch_attn_output = inbatch_attn_output.masked_fill(first_half_mask_expanded, 0.0)                
             
             # TODO: currently just add - we need to think more about other combinations - learnable parameter
             attn_output = attn_output + inbatch_attn_output
