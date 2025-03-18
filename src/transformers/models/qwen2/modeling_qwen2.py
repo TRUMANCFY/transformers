@@ -335,6 +335,9 @@ class Qwen2Attention(nn.Module):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
+        inbatch_attn: Optional[torch.Tensor] = None, # B x B
+        cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        original_attention_mask: Optional[torch.Tensor] = None, # B x L
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
@@ -378,6 +381,36 @@ class Qwen2Attention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
         attn_output = torch.matmul(attn_weights, value_states)
+
+        if inbatch_attn is not None and cached_key_value is not None:
+            cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
+            cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
+            cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
+            cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+
+            cached_key_expanded = cached_keys.unsqueeze(0)
+            query_states_expanded = query_states.unsqueeze(1)
+            inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if original_attention_mask is not None:
+                min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
+                padding_mask = original_attention_mask == 0
+                original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                    padding_mask, min_dtype
+                )                
+                # add original casual mask
+                inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+            # B (query) x B (key) x num_heads x seq_len x head_dim
+            inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
+            # 1 x B x num_heads x seq_len x head_dim
+            catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
+            # B x B x num_heads x seq_len x head_dim
+            inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
+            
+            inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
+            inbatch_attn_output = inbatch_attn_output.sum(dim=1)
+
+            attn_output = attn_output + inbatch_attn_output
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -556,6 +589,9 @@ class Qwen2SdpaAttention(Qwen2Attention):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
+        inbatch_attn: Optional[torch.Tensor] = None, # B x B
+        cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        original_attention_mask: Optional[torch.Tensor] = None, # B x L
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
@@ -573,6 +609,9 @@ class Qwen2SdpaAttention(Qwen2Attention):
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
+                inbatch_attn=inbatch_attn,
+                cached_key_value=cached_key_value,
+                original_attention_mask=original_attention_mask,
             )
 
         bsz, q_len, _ = hidden_states.size()
@@ -628,6 +667,52 @@ class Qwen2SdpaAttention(Qwen2Attention):
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=is_causal,
         )
+        
+        if inbatch_attn is not None and cached_key_value is not None:
+            cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
+            cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
+            cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
+            cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+
+            # 1 x B x num_heads x seq_len x head_dim
+            cached_key_expanded = cached_keys.unsqueeze(0)
+            # B x 1 x num_heads x seq_len x head_dim - Solved: may need to check whether we need to repeat_kv - for llama, normally self.num_heads == self.num_key_value_heads -> no need to repeat_kv
+            query_states_expanded = query_states.unsqueeze(1)
+            # B (query) x B (key) x num_heads x seq_len x seq_len
+            inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if original_attention_mask is not None:
+                # origianl_attention_mask is for key, instead of query
+                # as for query, it is already covered by the causal mask
+                min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
+                # original_attention_mask = original_attention_mask[None, :, None, None, :]
+                padding_mask = original_attention_mask == 0
+                original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                    padding_mask, min_dtype
+                )                
+                # add original casual mask
+                inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+
+            # B (query) x B (key) x num_heads x seq_len x seq_len
+            inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
+
+            # 1 x B x num_heads x seq_len x head_dim
+            catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
+            # B x B x num_heads x seq_len x head_dim
+            inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
+
+            value_norm = torch.norm(cached_values, p=2, dim=-1, keepdim=True)  # (..., seq_len, 1)
+            # weighted_value_norm: B x B x (num_head) x seq_len x 1
+            weighted_value_norm = torch.matmul(inbatch_attn_weights, value_norm)
+            epsilon = 1e-6  # Small constant for numerical stability
+
+            # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
+            # inbatch_attn_output : B x num_heads x seq_len x head_dim
+            inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
+            inbatch_attn_output = inbatch_attn_output.sum(dim=1)
+
+            # TODO: currently just add - we need to think more about other combinations - learnable parameter
+            attn_output = attn_output + inbatch_attn_output
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
@@ -666,6 +751,9 @@ class Qwen2DecoderLayer(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        inbatch_attn: Optional[torch.Tensor] = None,
+        cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        original_attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -705,6 +793,9 @@ class Qwen2DecoderLayer(nn.Module):
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
+            inbatch_attn=inbatch_attn,
+            cached_key_value=cached_key_value,
+            original_attention_mask=original_attention_mask,
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
@@ -890,6 +981,8 @@ class Qwen2Model(Qwen2PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inbatch_attn: Optional[torch.Tensor] = None,
+        cached_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -956,7 +1049,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = None
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -967,6 +1060,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     causal_mask,
                     position_ids,
                     past_key_values,
+                    inbatch_attn,
+                    cached_key_values[layer_idx] if cached_key_values is not None else None,
+                    attention_mask,
                     output_attentions,
                     use_cache,
                     cache_position,
@@ -978,6 +1074,9 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
+                    inbatch_attn=inbatch_attn,
+                    cached_key_value=cached_key_values[layer_idx] if cached_key_values is not None else None,
+                    original_attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
@@ -1116,6 +1215,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        inbatch_attn: Optional[torch.Tensor] = None,
+        cached_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
@@ -1169,6 +1270,8 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            inbatch_attn=inbatch_attn,
+            cached_key_values=cached_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             output_attentions=output_attentions,
