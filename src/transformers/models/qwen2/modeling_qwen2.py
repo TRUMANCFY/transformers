@@ -667,9 +667,6 @@ class Qwen2SdpaAttention(Qwen2Attention):
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=is_causal,
         )
-        
-        print('inbatch_attn:', inbatch_attn)
-        print('cached_key_value:', cached_key_value)
 
         if inbatch_attn is not None and cached_key_value is not None:
             cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
