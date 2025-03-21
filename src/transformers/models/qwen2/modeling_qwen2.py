@@ -668,6 +668,9 @@ class Qwen2SdpaAttention(Qwen2Attention):
             is_causal=is_causal,
         )
         
+        print('inbatch_attn:', inbatch_attn)
+        print('cached_key_value:', cached_key_value)
+
         if inbatch_attn is not None and cached_key_value is not None:
             cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
@@ -961,6 +964,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
             [Qwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self._attn_implementation = config._attn_implementation
+        print("self._attn_implementation", self._attn_implementation)
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen2RotaryEmbedding(config=config)
 
