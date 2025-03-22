@@ -668,7 +668,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
             is_causal=is_causal,
         )
 
-        if inbatch_attn is not None and cached_key_value is not None:
+        if inbatch_attn is not None and cached_key_value is not None:            
             cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
@@ -680,6 +680,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
             query_states_expanded = query_states.unsqueeze(1)
             # B (query) x B (key) x num_heads x seq_len x seq_len
             inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
             if original_attention_mask is not None:
                 # origianl_attention_mask is for key, instead of query
                 # as for query, it is already covered by the causal mask
@@ -695,22 +696,27 @@ class Qwen2SdpaAttention(Qwen2Attention):
             # B (query) x B (key) x num_heads x seq_len x seq_len
             inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
-
+            
             # 1 x B x num_heads x seq_len x head_dim
             catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
             # B x B x num_heads x seq_len x head_dim
             inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
-
+            
             value_norm = torch.norm(cached_values, p=2, dim=-1, keepdim=True)  # (..., seq_len, 1)
             # weighted_value_norm: B x B x (num_head) x seq_len x 1
             weighted_value_norm = torch.matmul(inbatch_attn_weights, value_norm)
+            
+            # if "head_normalization" in kwargs and kwargs["head_normalization"]:
+            #     weighted_value_norm = weighted_value_norm.sum(dim=2, keepdim=True)
+                        
             epsilon = 1e-6  # Small constant for numerical stability
+            inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
 
             # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
             # inbatch_attn_output : B x num_heads x seq_len x head_dim
-            inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
-            inbatch_attn_output = inbatch_attn_output.sum(dim=1)
-
+            inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
+            inbatch_attn_output = inbatch_attn_output.sum(dim=1)    
+            
             # TODO: currently just add - we need to think more about other combinations - learnable parameter
             attn_output = attn_output + inbatch_attn_output
 
