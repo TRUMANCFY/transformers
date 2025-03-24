@@ -772,15 +772,17 @@ class LlamaSdpaAttention(LlamaAttention):
             # B x B x num_heads x seq_len x head_dim
             inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
             
-            value_norm = torch.norm(cached_values, p=2, dim=-1, keepdim=True)  # (..., seq_len, 1)
-            # weighted_value_norm: B x B x (num_head) x seq_len x 1
-            weighted_value_norm = torch.matmul(inbatch_attn_weights, value_norm)
+            # for ablation study of v_norm
+            if not ("disable_v_norm" in kwargs and kwargs["disable_v_norm"]):
+                value_norm = torch.norm(cached_values, p=2, dim=-1, keepdim=True)  # (..., seq_len, 1)
+                # weighted_value_norm: B x B x (num_head) x seq_len x 1
+                weighted_value_norm = torch.matmul(inbatch_attn_weights, value_norm)
             
-            # if "head_normalization" in kwargs and kwargs["head_normalization"]:
-            #     weighted_value_norm = weighted_value_norm.sum(dim=2, keepdim=True)
+                # if "head_normalization" in kwargs and kwargs["head_normalization"]:
+                #     weighted_value_norm = weighted_value_norm.sum(dim=2, keepdim=True)
                         
-            epsilon = 1e-6  # Small constant for numerical stability
-            inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
+                epsilon = 1e-6  # Small constant for numerical stability
+                inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
 
             # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
             # inbatch_attn_output : B x num_heads x seq_len x head_dim
