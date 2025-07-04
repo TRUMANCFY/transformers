@@ -640,15 +640,15 @@ class LlamaFlashAttention2(LlamaAttention):
         return attn_output, attn_weights, past_key_value
 
 
-def is_one_hot(attn: torch.Tensor, *, dim: int = -1, tol: float = 1e-6) -> torch.BoolTensor:
-    """
-    Returns a Boolean mask of size B telling whether all the rows in the matrix are one-hot vectors.
-    """
-    # exactly ONE entry > 1-tol  *and* row sums to 1 (±tol)
-    max_val, max_idx = attn.max(dim=dim)
-    hot_enough   = (max_val > 1.0 - tol)
-    row_sum_ok   = (attn.sum(dim=dim) - 1.0).abs() < tol
-    return (hot_enough & row_sum_ok).all()
+# def is_one_hot(attn: torch.Tensor, *, dim: int = -1, tol: float = 1e-6) -> torch.BoolTensor:
+#     """
+#     Returns a Boolean mask of size B telling whether all the rows in the matrix are one-hot vectors.
+#     """
+#     # exactly ONE entry > 1-tol  *and* row sums to 1 (±tol)
+#     max_val, max_idx = attn.max(dim=dim)
+#     hot_enough   = (max_val > 1.0 - tol)
+#     row_sum_ok   = (attn.sum(dim=dim) - 1.0).abs() < tol
+#     return (hot_enough & row_sum_ok).all()
 
 class LlamaSdpaAttention(LlamaAttention):
     """
@@ -753,8 +753,7 @@ class LlamaSdpaAttention(LlamaAttention):
             cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
             cached_values = repeat_kv(cached_values, self.num_key_value_groups)
-
-            if is_one_hot(inbatch_attn):
+            if "is_one_hot" in kwargs and kwargs["is_one_hot"]:
                 sel_idx = inbatch_attn.argmax(dim=1)   # shape [B]
                 sel_keys = cached_keys[sel_idx] # [B, n_head, L, d]
                 sel_values = cached_values[sel_idx] # [B, n_head, L, d]

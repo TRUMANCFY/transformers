@@ -341,6 +341,7 @@ class Qwen2Attention(nn.Module):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
@@ -574,15 +575,15 @@ class Qwen2FlashAttention2(Qwen2Attention):
         return attn_output, attn_weights, past_key_value
 
 
-def is_one_hot(attn: torch.Tensor, *, dim: int = -1, tol: float = 1e-6) -> torch.BoolTensor:
-    """
-    Returns a Boolean mask of size B telling whether all the rows in the matrix are one-hot vectors.
-    """
-    # exactly ONE entry > 1-tol  *and* row sums to 1 (±tol)
-    max_val, max_idx = attn.max(dim=dim)
-    hot_enough   = (max_val > 1.0 - tol)
-    row_sum_ok   = (attn.sum(dim=dim) - 1.0).abs() < tol
-    return (hot_enough & row_sum_ok).all()
+# def is_one_hot(attn: torch.Tensor, *, dim: int = -1, tol: float = 1e-6) -> torch.BoolTensor:
+#     """
+#     Returns a Boolean mask of size B telling whether all the rows in the matrix are one-hot vectors.
+#     """
+#     # exactly ONE entry > 1-tol  *and* row sums to 1 (±tol)
+#     max_val, max_idx = attn.max(dim=dim)
+#     hot_enough   = (max_val > 1.0 - tol)
+#     row_sum_ok   = (attn.sum(dim=dim) - 1.0).abs() < tol
+#     return (hot_enough & row_sum_ok).all()
 
 
 class Qwen2SdpaAttention(Qwen2Attention):
@@ -606,6 +607,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
@@ -685,7 +687,7 @@ class Qwen2SdpaAttention(Qwen2Attention):
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
             cached_values = repeat_kv(cached_values, self.num_key_value_groups)
 
-            if is_one_hot(inbatch_attn):
+            if "is_one_hot" in kwargs and kwargs["is_one_hot"]:
                 sel_idx = inbatch_attn.argmax(dim=1)   # shape [B]
                 sel_keys = cached_keys[sel_idx] # [B, n_head, L, d]
                 sel_values = cached_values[sel_idx] # [B, n_head, L, d]
@@ -847,6 +849,7 @@ class Qwen2DecoderLayer(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
             position_embeddings=position_embeddings,
+            **kwargs,
         )
         hidden_states = residual + hidden_states
 
@@ -1038,6 +1041,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1116,6 +1120,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     use_cache,
                     cache_position,
                     position_embeddings,
+                    **kwargs,
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1130,6 +1135,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
                     use_cache=use_cache,
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
+                    **kwargs,
                 )
 
             hidden_states = layer_outputs[0]
@@ -1328,6 +1334,7 @@ class Qwen2ForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            **kwargs,
         )
 
         hidden_states = outputs[0]
