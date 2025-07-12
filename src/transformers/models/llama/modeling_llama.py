@@ -754,12 +754,21 @@ class LlamaSdpaAttention(LlamaAttention):
             cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
             cached_values = repeat_kv(cached_values, self.num_key_value_groups)
             if "is_one_hot" in kwargs and kwargs["is_one_hot"]:
-                sel_idx = inbatch_attn.argmax(dim=1)   # shape [B]
-                sel_keys = cached_keys[sel_idx] # [B, n_head, L, d]
-                sel_values = cached_values[sel_idx] # [B, n_head, L, d]
+                attn_w = inbatch_attn.type_as(cached_keys)          # keep dtype/device
+
+                # === 1. mix the cached keys / values ========================================================
+                # cached_keys / cached_values: [B_source, n_head, L_k, d]
+                # wanted output:              [B_query , n_head, L_k, d]
+                #
+                # Each line of inbatch_attn already sums to 1 → simple weighted sum.
+                # Using einsum keeps things clear and autograd-friendly.
+                # --------------------------------------------------------------------------------------------
+                sel_keys   = torch.einsum('bs,shld -> bhld', attn_w, cached_keys)
+                sel_values = torch.einsum('bs,shld -> bhld', attn_w, cached_values)
 
                 if original_attention_mask is not None:
-                    sel_pad_mask = original_attention_mask[sel_idx]      # [B, L]
+                    sel_pad_mask = torch.einsum('bs,sl -> bl', attn_w, original_attention_mask.float())
+
 
                 inbatch_attn_weights = torch.matmul(
                     query_states,                               # [B, n_head, L_q, d]
