@@ -767,8 +767,8 @@ class LlamaSdpaAttention(LlamaAttention):
                 sel_values = torch.einsum('bs,shld -> bhld', attn_w, cached_values)
 
                 if original_attention_mask is not None:
-                    w_for_mask   = attn_w.to(dtype=original_attention_mask.dtype)
-                    sel_pad_mask = torch.einsum('bs,sl -> bl', w_for_mask, original_attention_mask)
+                    sel_idx = inbatch_attn.argmax(dim=1)   # shape [B]
+                    sel_pad_mask = original_attention_mask[sel_idx]      # [B, L]
 
                 inbatch_attn_weights = torch.matmul(
                     query_states,                               # [B, n_head, L_q, d]
