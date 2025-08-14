@@ -542,9 +542,13 @@ class LlamaFlashAttention2(LlamaAttention):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: bool = False,
+        inbatch_attn: Optional[torch.Tensor] = None, # B x B
+        cached_key_value: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
+        original_attention_mask: Optional[torch.Tensor] = None, # B x L
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if isinstance(past_key_value, StaticCache):
             raise ValueError(
@@ -631,6 +635,110 @@ class LlamaFlashAttention2(LlamaAttention):
             is_causal=self.is_causal,
         )
 
+        if inbatch_attn is not None and cached_key_value is not None:
+            # transpose back
+            query_states = query_states.transpose(1, 2)
+            
+            cached_keys = cached_key_value[0] # B x num_heads x seq_len x head_dim
+            cached_values = cached_key_value[1] # B x num_heads x seq_len x head_dim
+            cached_keys = repeat_kv(cached_keys, self.num_key_value_groups)
+            cached_values = repeat_kv(cached_values, self.num_key_value_groups)
+            if "is_one_hot" in kwargs and kwargs["is_one_hot"]:
+                attn_w = inbatch_attn.type_as(cached_keys)          # keep dtype/device
+
+                # === 1. mix the cached keys / values ========================================================
+                # cached_keys / cached_values: [B_source, n_head, L_k, d]
+                # wanted output:              [B_query , n_head, L_k, d]
+                #
+                # Each line of inbatch_attn already sums to 1 → simple weighted sum.
+                # Using einsum keeps things clear and autograd-friendly.
+                # --------------------------------------------------------------------------------------------
+                sel_keys   = torch.einsum('bs,shld -> bhld', attn_w, cached_keys)
+                sel_values = torch.einsum('bs,shld -> bhld', attn_w, cached_values)
+
+                if original_attention_mask is not None:
+                    sel_idx = inbatch_attn.argmax(dim=1)   # shape [B]
+                    sel_pad_mask = original_attention_mask[sel_idx]      # [B, L]
+
+                inbatch_attn_weights = torch.matmul(
+                    query_states,                               # [B, n_head, L_q, d]
+                    sel_keys.transpose(-2, -1)                  # [B, n_head, d, L_k]
+                ) / math.sqrt(self.head_dim)
+    
+                if original_attention_mask is not None:
+                    min_val = torch.finfo(inbatch_attn_weights.dtype).min
+                    key_mask = sel_pad_mask[:, None, None, :]           # [B,1,1,L_k]
+                    key_mask = key_mask.to(inbatch_attn_weights.dtype).masked_fill(key_mask == 0, min_val)
+                    inbatch_attn_weights += key_mask
+
+                inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
+
+                inbatch_attn_output = torch.matmul(inbatch_attn_weights, sel_values)
+
+                if not ("disable_v_norm" in kwargs and kwargs["disable_v_norm"]):
+                    v_norm  = torch.norm(sel_values, p=2, dim=-1, keepdim=True)          # [B,n_head,L_k,1]
+                    wv_norm = torch.matmul(inbatch_attn_weights, v_norm)                 # [B,n_head,L_q,1]
+                    eps = 1e-6
+                    inbatch_attn_output = inbatch_attn_output / (wv_norm + eps)
+                
+            else:
+                # 1 x B x num_heads x seq_len x head_dim
+                cached_key_expanded = cached_keys.unsqueeze(0)
+                # B x 1 x num_heads x seq_len x head_dim - Solved: may need to check whether we need to repeat_kv - for llama, normally self.num_heads == self.num_key_value_heads -> no need to repeat_kv
+                query_states_expanded = query_states.unsqueeze(1)
+                # B (query) x B (key) x num_heads x seq_len x seq_len
+                inbatch_attn_weights = torch.matmul(query_states_expanded, cached_key_expanded.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+                if original_attention_mask is not None:
+                    # origianl_attention_mask is for key, instead of query
+                    # as for query, it is already covered by the causal mask
+                    min_dtype = torch.finfo(inbatch_attn_weights.dtype).min
+                    # original_attention_mask = original_attention_mask[None, :, None, None, :]
+                    padding_mask = original_attention_mask == 0
+                    original_attention_mask = original_attention_mask.to(query_states.dtype).masked_fill(
+                        padding_mask, min_dtype
+                    )                
+                    # add original casual mask
+                    inbatch_attn_weights = inbatch_attn_weights + original_attention_mask[None, :, None, None, : cached_keys.shape[-2]]
+
+                # B (query) x B (key) x num_heads x seq_len x seq_len
+                inbatch_attn_weights = nn.functional.softmax(inbatch_attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                inbatch_attn_weights = nn.functional.dropout(inbatch_attn_weights, p=self.attention_dropout, training=self.training)
+                
+                # 1 x B x num_heads x seq_len x head_dim
+                catched_value_expanded = cached_values.unsqueeze(0) # TODO: can be normalized
+                # B x B x num_heads x seq_len x head_dim
+                inbatch_attn_output = torch.matmul(inbatch_attn_weights, catched_value_expanded)
+                
+                # for ablation study of v_norm
+                if not ("disable_v_norm" in kwargs and kwargs["disable_v_norm"]):
+                    value_norm = torch.norm(cached_values, p=2, dim=-1, keepdim=True)  # (..., seq_len, 1)
+                    # weighted_value_norm: B x B x (num_head) x seq_len x 1
+                    weighted_value_norm = torch.matmul(inbatch_attn_weights, value_norm)
+                
+                    # if "head_normalization" in kwargs and kwargs["head_normalization"]:
+                    #     weighted_value_norm = weighted_value_norm.sum(dim=2, keepdim=True)
+                            
+                    epsilon = 1e-6  # Small constant for numerical stability
+                    inbatch_attn_output = inbatch_attn_output / (weighted_value_norm + epsilon)
+
+                # inbatch_attn : B x B -> B x B x num_heads x seq_len x head_dim           
+                # inbatch_attn_output : B x num_heads x seq_len x head_dim
+                inbatch_attn_output = inbatch_attn_output * inbatch_attn[:, :, None, None, None]
+                inbatch_attn_output = inbatch_attn_output.sum(dim=1)
+
+                if "first_half_mask" in kwargs and kwargs["first_half_mask"] is not None:
+                    # B x seq_len
+                    first_half_mask = kwargs["first_half_mask"]
+                    # remove the first half of the sequence
+                    first_half_mask_expanded = first_half_mask.unsqueeze(1).unsqueeze(-1).bool()
+                    inbatch_attn_output = inbatch_attn_output.masked_fill(first_half_mask_expanded, 0.0)                
+                
+            # TODO: currently just add - we need to think more about other combinations - learnable parameter
+            # special operation for FlashAttention
+            attn_output = attn_output + inbatch_attn_output.transpose(1, 2)
+        
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 
@@ -1096,6 +1204,8 @@ class LlamaModel(LlamaPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
+        print("Attention: ", self.config._attn_implementation)
+
     def get_input_embeddings(self):
         return self.embed_tokens
 
@@ -1180,21 +1290,62 @@ class LlamaModel(LlamaPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
+                def custom_forward(
                     hidden_states,
                     causal_mask,
                     position_ids,
                     past_key_values,
                     inbatch_attn,
-                    cached_key_values[layer_idx] if cached_key_values is not None else None,
+                    cached_kv_i,
                     attention_mask,
                     output_attentions,
                     use_cache,
                     cache_position,
                     position_embeddings,
-                    **kwargs,
+                ):
+                    return decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        inbatch_attn=inbatch_attn,
+                        cached_key_value=cached_kv_i,
+                        original_attention_mask=attention_mask,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        **kwargs,  # <- safely injected here
+                    )
+
+                layer_outputs = self._gradient_checkpointing_func(
+                    custom_forward,
+                    hidden_states,
+                    causal_mask,
+                    position_ids,
+                    past_key_values,
+                    inbatch_attn,
+                    cached_kv_i,
+                    attention_mask,
+                    output_attentions,
+                    use_cache,
+                    cache_position,
+                    position_embeddings,
                 )
+                # layer_outputs = self._gradient_checkpointing_func(
+                #     decoder_layer.__call__,
+                #     hidden_states,
+                #     causal_mask,
+                #     position_ids,
+                #     past_key_values,
+                #     inbatch_attn,
+                #     cached_key_values[layer_idx] if cached_key_values is not None else None,
+                #     attention_mask,
+                #     output_attentions,
+                #     use_cache,
+                #     cache_position,
+                #     position_embeddings,
+                # )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
