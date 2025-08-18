@@ -1290,36 +1290,8 @@ class LlamaModel(LlamaPreTrainedModel):
                 all_hidden_states += (hidden_states,)
 
             if self.gradient_checkpointing and self.training:
-                def custom_forward(
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    inbatch_attn,
-                    cached_key_value,
-                    attention_mask,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                ):
-                    return decoder_layer(
-                        hidden_states,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        inbatch_attn=inbatch_attn,
-                        cached_key_value=cached_key_value,
-                        original_attention_mask=attention_mask,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                        position_embeddings=position_embeddings,
-                        **kwargs,  # <- safely injected here
-                    )
-
                 layer_outputs = self._gradient_checkpointing_func(
-                    custom_forward,
+                    decoder_layer.__call__,
                     hidden_states,
                     causal_mask,
                     position_ids,
@@ -1332,20 +1304,6 @@ class LlamaModel(LlamaPreTrainedModel):
                     cache_position,
                     position_embeddings,
                 )
-                # layer_outputs = self._gradient_checkpointing_func(
-                #     decoder_layer.__call__,
-                #     hidden_states,
-                #     causal_mask,
-                #     position_ids,
-                #     past_key_values,
-                #     inbatch_attn,
-                #     cached_key_values[layer_idx] if cached_key_values is not None else None,
-                #     attention_mask,
-                #     output_attentions,
-                #     use_cache,
-                #     cache_position,
-                #     position_embeddings,
-                # )
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
