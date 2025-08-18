@@ -15,6 +15,8 @@
 
 """Processor class for Mllama."""
 
+"""Processor class for Mllama."""
+
 from typing import List, Optional, Union
 
 import numpy as np
