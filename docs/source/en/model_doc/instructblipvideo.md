@@ -9,14 +9,17 @@ Unless required by applicable law or agreed to in writing, software distributed 
 an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 specific language governing permissions and limitations under the License.
 -->
+*This model was released on 2023-05-11 and added to Hugging Face Transformers on 2024-06-25.*
 
 # InstructBlipVideo
 
-## Overview
+<div class="flex flex-wrap space-x-1">
+<img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-DE3412?style=flat&logo=pytorch&logoColor=white">
+</div>
 
 ## Overview
 
-The InstructBLIPVideo is an extension of the models proposed in [InstructBLIP: Towards General-purpose Vision-Language Models with Instruction Tuning](https://arxiv.org/abs/2305.06500) by Wenliang Dai, Junnan Li, Dongxu Li, Anthony Meng Huat Tiong, Junqi Zhao, Weisheng Wang, Boyang Li, Pascale Fung, Steven Hoi.
+The InstructBLIPVideo is an extension of the models proposed in [InstructBLIP: Towards General-purpose Vision-Language Models with Instruction Tuning](https://huggingface.co/papers/2305.06500) by Wenliang Dai, Junnan Li, Dongxu Li, Anthony Meng Huat Tiong, Junqi Zhao, Weisheng Wang, Boyang Li, Pascale Fung, Steven Hoi.
 InstructBLIPVideo uses the same architecture as [InstructBLIP](instructblip) and works with the same checkpoints as [InstructBLIP](instructblip). The only difference is the ability to process videos.
 
 The abstract from the paper is the following:
@@ -26,7 +29,7 @@ The abstract from the paper is the following:
 <img src="https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/model_doc/instructblip_architecture.jpg"
 alt="drawing" width="600"/>
 
-<small> InstructBLIPVideo architecture. Taken from the <a href="https://arxiv.org/abs/2305.06500">original paper.</a> </small>
+<small> InstructBLIPVideo architecture. Taken from the <a href="https://huggingface.co/papers/2305.06500">original paper.</a> </small>
 
 This model was contributed by [RaushanTurganbay](https://huggingface.co/RaushanTurganbay).
 The original code can be found [here](https://github.com/salesforce/LAVIS/tree/main/projects/instructblip).
@@ -56,6 +59,12 @@ The attributes can be obtained from model config, as `model.config.num_query_tok
 
 [[autodoc]] InstructBlipVideoProcessor
 
+
+## InstructBlipVideoVideoProcessor
+
+[[autodoc]] InstructBlipVideoVideoProcessor
+    - preprocess
+
 ## InstructBlipVideoImageProcessor
 
 [[autodoc]] InstructBlipVideoImageProcessor
@@ -69,6 +78,10 @@ The attributes can be obtained from model config, as `model.config.num_query_tok
 ## InstructBlipVideoQFormerModel
 
 [[autodoc]] InstructBlipVideoQFormerModel
+    - forward
+
+## InstructBlipVideoModel
+[[autodoc]] InstructBlipVideoModel
     - forward
 
 ## InstructBlipVideoForConditionalGeneration

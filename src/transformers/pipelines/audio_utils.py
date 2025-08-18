@@ -2,7 +2,7 @@
 import datetime
 import platform
 import subprocess
-from typing import Optional, Tuple, Union
+from typing import Optional, Union
 
 import numpy as np
 
@@ -68,7 +68,7 @@ def ffmpeg_microphone(
             The name of the format of the audio samples to be returned by ffmpeg. The standard is `f32le`, `s16le`
             could also be used.
         ffmpeg_input_device (`str`, *optional*):
-            The indentifier of the input device to be used by ffmpeg (i.e. ffmpeg's '-i' argument). If unset,
+            The identifier of the input device to be used by ffmpeg (i.e. ffmpeg's '-i' argument). If unset,
             the default input device will be used. See `https://www.ffmpeg.org/ffmpeg-devices.html#Input-Devices`
             for how to specify and list input devices.
         ffmpeg_additional_args (`list[str]`, *optional*):
@@ -135,7 +135,7 @@ def ffmpeg_microphone_live(
     sampling_rate: int,
     chunk_length_s: float,
     stream_chunk_s: Optional[int] = None,
-    stride_length_s: Optional[Union[Tuple[float, float], float]] = None,
+    stride_length_s: Optional[Union[tuple[float, float], float]] = None,
     format_for_conversion: str = "f32le",
     ffmpeg_input_device: Optional[str] = None,
     ffmpeg_additional_args: Optional[list[str]] = None,
@@ -226,7 +226,7 @@ def ffmpeg_microphone_live(
         yield item
 
 
-def chunk_bytes_iter(iterator, chunk_len: int, stride: Tuple[int, int], stream: bool = False):
+def chunk_bytes_iter(iterator, chunk_len: int, stride: tuple[int, int], stream: bool = False):
     """
     Reads raw bytes from an iterator and does chunks of length `chunk_len`. Optionally adds `stride` to each chunks to
     get overlaps. `stream` is used to return partial results even if a full `chunk_len` is not yet available.
