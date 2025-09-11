@@ -901,8 +901,7 @@ class LlamaSdpaAttention(LlamaAttention):
                     inbatch_attn_output = inbatch_attn_output / (wv_norm + eps)
                 
             else:
-
-                if "sparse_attn" in kwargs and kwargs["sparse_attn"]::
+                if "sparse_attn" in kwargs and kwargs["sparse_attn"]:
                     # -------- Sparse top-k per row (memory-efficient) --------
                     top_k = int(kwargs.get("top_k", 4))
                     B = inbatch_attn.size(0)
