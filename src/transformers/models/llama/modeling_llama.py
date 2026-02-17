@@ -1303,6 +1303,7 @@ class LlamaModel(LlamaPreTrainedModel):
         **kwargs,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        inbatch_attn_layers = kwargs.pop("inbatch_attn_layers", None)  # e.g. {0, 4, 8, 12, ...} or None = all
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
