@@ -57,6 +57,30 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "LlamaConfig"
 
 
+def build_inbatch_attn_layers(
+    num_hidden_layers: int,
+    strategy: str = "all",
+    stride: int = 4,
+    layers: list = None,
+    last_n: int = None,
+):
+    """Build set of layer indices that should use in-batch attention.
+    
+    Returns None for "all layers" (original behavior), or a set of indices.
+    """
+    if strategy == "all":
+        return None
+    elif strategy == "stride":
+        return set(range(0, num_hidden_layers, stride))
+    elif strategy == "last_n":
+        n = last_n or 4
+        return set(range(max(0, num_hidden_layers - n), num_hidden_layers))
+    elif strategy == "explicit":
+        return set(layers) if layers else set()
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+
 def _prepare_4d_causal_attention_mask_with_cache_position(
     attention_mask: torch.Tensor,
     sequence_length: int,
@@ -1338,6 +1362,15 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            _use_inbatch = (
+                inbatch_attn is not None
+                and cached_key_values is not None
+                and (inbatch_attn_layers is None or layer_idx in inbatch_attn_layers)
+            )
+
+            _layer_inbatch_attn = inbatch_attn if _use_inbatch else None
+            _layer_cached_kv = cached_key_values[layer_idx] if _use_inbatch else None
+
             if self.gradient_checkpointing and self.training:
                 layer_outputs = self._gradient_checkpointing_func(
                     decoder_layer.__call__,
@@ -1359,8 +1392,10 @@ class LlamaModel(LlamaPreTrainedModel):
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
-                    inbatch_attn=inbatch_attn,
-                    cached_key_value=cached_key_values[layer_idx] if cached_key_values is not None else None,
+                    # inbatch_attn=inbatch_attn,
+                    # cached_key_value=cached_key_values[layer_idx] if cached_key_values is not None else None,
+                    inbatch_attn=_layer_inbatch_attn,    # ← CHANGED: gated
+                    cached_key_value=_layer_cached_kv,    # ← CHANGED: gated
                     original_attention_mask=attention_mask,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
